@@ -53,6 +53,28 @@
       "minimumReleaseAge": "3 days"
     },
     {
+      "description": "Cluster API and the Kubernetes client libraries move together: sigs.k8s.io/cluster-api vN is built against one k8s.io/* minor and one controller-runtime minor, and mixing them breaks the v1beta2 contract. Dependabot proposed exactly that twice against this repository (#2 and #17: k8s.io/* to v0.37.0 and controller-runtime to v0.25.0 while cluster-api is pinned at v1.13.4). Group them so a bump is reviewed as the single decision it is, never as separate automerged patches.",
+      "groupName": "Cluster API and Kubernetes libraries",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "sigs.k8s.io/cluster-api",
+        "sigs.k8s.io/controller-runtime",
+        "k8s.io/api",
+        "k8s.io/apiextensions-apiserver",
+        "k8s.io/apimachinery",
+        "k8s.io/client-go",
+        "k8s.io/component-base",
+        "k8s.io/utils"
+      ],
+      "matchUpdateTypes": [
+        "major",
+        "minor"
+      ],
+      "dependencyDashboardApproval": true
+    },
+    {
       "description": "Actions are pinned to full-semver tags, so a digest-only change means the tag was moved (the tj-actions pattern). Never a routine PR: require explicit approval on the dependency dashboard.",
       "matchManagers": [
         "github-actions"
