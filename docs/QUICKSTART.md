@@ -1,6 +1,6 @@
 # Quickstart
 
-> Last verified against: cluster-api-provider-kairos-fleet v0.1.2,
+> Last verified against: cluster-api-provider-kairos-fleet v0.1.3,
 > Cluster API v1.13.4 (v1beta2 contract), Kairos v4.1.2, k3s (k0s also
 > supported).
 
