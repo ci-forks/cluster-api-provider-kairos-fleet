@@ -1,6 +1,6 @@
 # API reference
 
-> Last verified against: cluster-api-provider-kairos-fleet v0.1.2,
+> Last verified against: cluster-api-provider-kairos-fleet v0.1.3,
 > API group `infrastructure.cluster.x-k8s.io/v1alpha1`.
 
 A hand-written field reference for the four Kairos Fleet API kinds. For the

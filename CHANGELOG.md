@@ -7,6 +7,37 @@ Entries are grouped by Added, Changed, Fixed, Security, and Breaking as
 needed; see [docs/release-notes/](docs/release-notes/) for the fuller
 narrative behind each release.
 
+## [v0.1.3] - 2026-09-17
+
+A maintenance release. No functional change to the controller, CRDs, cluster
+template or RBAC: `go.mod`, `api/`, `internal/`, `templates/` and `config/` are
+untouched since v0.1.2. No migration steps. See the
+[v0.1.3 release notes](docs/release-notes/v0.1.3.md).
+
+### Changed
+
+- The controller image is built with Go 1.27 instead of Go 1.26, so the binary
+  picks up that toolchain's standard library fixes; the builder stays pinned by
+  digest. `go.mod`'s `go` directive stays at 1.26.0 deliberately — the builder
+  only has to be at least the directive, and the directive cannot be raised
+  past what golangci-lint is built with, so the lint job is pinned to 1.26
+  until a golangci-lint release targets 1.27.
+- Scanning and dependency updates follow the kairos-io org practice: Google's
+  reusable OSV-Scanner workflow replaces Trivy, and Renovate (`renovate.json`)
+  replaces Dependabot, with Dependabot security updates disabled at the
+  repository level.
+  - Scope note: OSV-Scanner reads declared dependencies, where Trivy read the
+    built image including its base layer. Base-image CVEs are now addressed by
+    the digest bumps Renovate proposes.
+- Renovate holds the Go toolchain and the Cluster API / Kubernetes library set
+  for explicit approval rather than opening them automatically. Dependabot
+  twice proposed moving `k8s.io/*` to v0.37.0 and controller-runtime to v0.25.0
+  against a provider pinned to `sigs.k8s.io/cluster-api v1.13.4`; the grouping
+  rule stops Renovate inheriting that behaviour.
+- Release bodies now come from `docs/release-notes/<tag>.md` rather than
+  GitHub's auto-generated commit list, which had left the curated notes
+  unpublished; v0.1.2's body was corrected by hand after the fact.
+
 ## [v0.1.2] - 2026-09-09
 
 A fix release. Four defects found by running the provider against a live
