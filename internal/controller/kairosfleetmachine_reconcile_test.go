@@ -22,6 +22,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -31,6 +32,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	infrav1 "github.com/kairos-io/cluster-api-provider-kairos-fleet/api/v1alpha1"
 	"github.com/kairos-io/cluster-api-provider-kairos-fleet/internal/fleet"
@@ -462,5 +465,116 @@ func TestMachineReconcile_RetriesAFailedApply(t *testing.T) {
 	reconcileKFM(t, r) // completed -> reboot
 	if len(fc.Reboots) != 1 {
 		t.Fatalf("expected the retry to reach the reboot step, got %+v", fc.Reboots)
+	}
+}
+
+// deletingFixture returns the standard object graph with the KairosFleetMachine
+// claimed, finalized and deleting, minus the objects named in drop.
+func deletingFixture(drop ...string) []client.Object {
+	dropped := map[string]bool{}
+	for _, name := range drop {
+		dropped[name] = true
+	}
+	kept := []client.Object{}
+	for _, o := range testFixture(true) {
+		if dropped[o.GetName()] {
+			continue
+		}
+		if kfm, ok := o.(*infrav1.KairosFleetMachine); ok {
+			kfm.Annotations = map[string]string{infrav1.NodeIDAnnotation: testNodeID}
+			kfm.Finalizers = []string{infrav1.KairosFleetMachineFinalizer}
+			now := metav1.Now()
+			kfm.DeletionTimestamp = &now
+		}
+		kept = append(kept, o)
+	}
+	return kept
+}
+
+func assertKFMGone(t *testing.T, c client.Client) {
+	t.Helper()
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "kfm"}, &infrav1.KairosFleetMachine{})
+	if err == nil {
+		t.Fatalf("expected the finalizer to be removed, the KairosFleetMachine is still present")
+	}
+}
+
+// The KairosFleetCluster controller removes its own finalizer as soon as it is
+// deleted, so the InfraCluster can be gone while machines are still terminating.
+// Waiting for it would strand the Machine, and the whole Cluster delete behind it.
+func TestMachineReconcile_DeletesWhenInfraClusterIsGone(t *testing.T) {
+	fc := &fleet.FakeClient{}
+	r, c := newReconciler(t, fc, deletingFixture("fc"))
+
+	reconcileKFM(t, r)
+	assertKFMGone(t, c)
+	if len(fc.Releases) != 0 {
+		t.Fatalf("no release is possible without a connection, got %+v", fc.Releases)
+	}
+}
+
+// Same for the admin-token Secret: once it is gone there is no way left to reach
+// AuroraBoot, and no later reconcile will find one.
+func TestMachineReconcile_DeletesWhenAdminTokenSecretIsGone(t *testing.T) {
+	fc := &fleet.FakeClient{}
+	r, c := newReconciler(t, fc, deletingFixture("ab-token"))
+
+	reconcileKFM(t, r)
+	assertKFMGone(t, c)
+}
+
+// A KairosFleetCluster that never carried a usable connection is just as permanent.
+func TestMachineReconcile_DeletesWhenConnectionIsIncomplete(t *testing.T) {
+	objs := deletingFixture()
+	for _, o := range objs {
+		if s, ok := o.(*corev1.Secret); ok && s.Name == "ab-token" {
+			s.Data = map[string][]byte{adminTokenSecretKey: []byte("")}
+		}
+	}
+	fc := &fleet.FakeClient{}
+	r, c := newReconciler(t, fc, objs)
+
+	reconcileKFM(t, r)
+	assertKFMGone(t, c)
+}
+
+// A read error that is not a NotFound can succeed on the next attempt, so the
+// reconcile must fail loudly instead of removing the finalizer and leaking the
+// claim: the node would stay claimed in its group with nothing left to release it.
+func TestMachineReconcile_KeepsFinalizerOnTransientReadError(t *testing.T) {
+	s := testScheme(t)
+	boom := apierrors.NewServiceUnavailable("etcd leader election")
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(deletingFixture()...).
+		WithStatusSubresource(&infrav1.KairosFleetMachine{}, &infrav1.KairosFleetCluster{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*infrav1.KairosFleetCluster); ok {
+					return boom
+				}
+				return cl.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+	fc := &fleet.FakeClient{}
+	r := &KairosFleetMachineReconciler{
+		Client:             c,
+		Scheme:             s,
+		FleetClientFactory: func(_, _ string) fleet.Client { return fc },
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: testNS, Name: "kfm"},
+	})
+	if err == nil {
+		t.Fatalf("expected a transient read error to surface, not a silent finalizer removal")
+	}
+	kfm := &infrav1.KairosFleetMachine{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "kfm"}, kfm); err != nil {
+		t.Fatalf("expected the KairosFleetMachine to still be there: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(kfm, infrav1.KairosFleetMachineFinalizer) {
+		t.Fatalf("expected the finalizer to be kept so the claim is not leaked")
 	}
 }

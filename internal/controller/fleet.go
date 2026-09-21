@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -68,12 +69,18 @@ func DefaultFleetClientFactory(baseURL, token string) fleet.Client {
 	return fleet.New(baseURL, token)
 }
 
+// errConnectionIncomplete marks a KairosFleetCluster whose AuroraBoot connection can
+// never be resolved as written: no url, or an admin-token Secret carrying no token.
+// Unlike a read error it does not recover on its own, so a caller that needs the
+// client only for best-effort cleanup can stop waiting for it.
+var errConnectionIncomplete = errors.New("AuroraBoot connection is incomplete")
+
 // resolveFleetClient builds a fleet.Client for the given KairosFleetCluster by reading
 // the AuroraBoot admin token from the referenced Secret. The token is never logged.
 func resolveFleetClient(ctx context.Context, c client.Client, factory FleetClientFactory, fleetCluster *infrav1.KairosFleetCluster) (fleet.Client, error) {
 	conn := fleetCluster.Spec.AuroraBoot
 	if conn.URL == "" {
-		return nil, fmt.Errorf("KairosFleetCluster %s/%s has no auroraboot.url", fleetCluster.Namespace, fleetCluster.Name)
+		return nil, fmt.Errorf("KairosFleetCluster %s/%s has no auroraboot.url: %w", fleetCluster.Namespace, fleetCluster.Name, errConnectionIncomplete)
 	}
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Namespace: fleetCluster.Namespace, Name: conn.AdminTokenSecretRef.Name}
@@ -82,7 +89,7 @@ func resolveFleetClient(ctx context.Context, c client.Client, factory FleetClien
 	}
 	token := string(secret.Data[adminTokenSecretKey])
 	if token == "" {
-		return nil, fmt.Errorf("AuroraBoot admin token Secret %s has no %q key", key, adminTokenSecretKey)
+		return nil, fmt.Errorf("AuroraBoot admin token Secret %s has no %q key: %w", key, adminTokenSecretKey, errConnectionIncomplete)
 	}
 	return factory(conn.URL, token), nil
 }
