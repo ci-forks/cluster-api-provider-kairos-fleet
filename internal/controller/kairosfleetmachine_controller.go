@@ -53,6 +53,12 @@ const (
 	// never permit the command does not accumulate failures quickly, short enough
 	// that fixing the policy visibly unblocks the machine.
 	retryCloudConfigRequeue = 60 * time.Second
+
+	// retryRebootRequeue paces re-issuing the reboot after the node rejected or
+	// failed it, for the same reasons as retryCloudConfigRequeue: the reboot is a
+	// separate phonehome command with a separate policy gate, so it can be
+	// rejected on a node that accepted the apply.
+	retryRebootRequeue = 60 * time.Second
 )
 
 // KairosFleetMachineReconciler reconciles a KairosFleetMachine object.
@@ -202,7 +208,7 @@ func (r *KairosFleetMachineReconciler) reconcileNormal(ctx context.Context, flee
 	// processes the staged /oem config (apply-cloud-config writes the file but does
 	// not reboot).
 	if fleetMachine.Annotations[rebootRequestedAtAnnotation] == "" {
-		applied, failed, failMsg := r.applyState(ctx, fc, nodeID, fleetMachine.Annotations[cloudConfigCommandIDAnnotation])
+		applied, failed, failMsg := r.commandState(ctx, fc, nodeID, fleetMachine.Annotations[cloudConfigCommandIDAnnotation], fleet.CommandApplyCloudConfig)
 		if failed {
 			// A failed apply is recoverable, not terminal: the usual cause is a
 			// node-side phonehome policy that does not permit apply-cloud-config,
@@ -224,12 +230,15 @@ func (r *KairosFleetMachineReconciler) reconcileNormal(ctx context.Context, flee
 			r.notReady(fleetMachine, "ApplyingCloudConfig", "Waiting for the node to write the bootstrap cloud-config")
 			return ctrl.Result{RequeueAfter: waitForRejoinRequeue}, nil
 		}
-		if _, err := fc.Reboot(ctx, nodeID); err != nil {
+		cmd, err := fc.Reboot(ctx, nodeID)
+		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("rebooting node %s: %w", nodeID, err)
 		}
-		annotations.AddAnnotations(fleetMachine, map[string]string{
-			rebootRequestedAtAnnotation: time.Now().UTC().Format(time.RFC3339),
-		})
+		requested := map[string]string{rebootRequestedAtAnnotation: time.Now().UTC().Format(time.RFC3339)}
+		if cmd != nil && cmd.ID != "" {
+			requested[rebootCommandIDAnnotation] = cmd.ID
+		}
+		annotations.AddAnnotations(fleetMachine, requested)
 		log.Info("Requested node reboot to apply cloud-config", "nodeID", nodeID)
 		r.notReady(fleetMachine, "Rebooting", "Rebooting the node to apply its bootstrap configuration")
 		return ctrl.Result{RequeueAfter: waitForRejoinRequeue}, nil
@@ -246,6 +255,20 @@ func (r *KairosFleetMachineReconciler) reconcileNormal(ctx context.Context, flee
 		return ctrl.Result{}, fmt.Errorf("getting node %s: %w", nodeID, err)
 	}
 	if !r.rejoinedAfterReboot(fleetMachine, node) {
+		// The reboot is a phonehome command in its own right, gated by the node's
+		// own allowed_commands policy, so a node that accepted apply-cloud-config
+		// can still reject the reboot. Read that command back before settling into
+		// the rejoin wait: without this the machine waits on a boot that will never
+		// happen, and the node's reason for refusing is never surfaced. Only a
+		// terminal failure counts - a reboot the node accepted usually never
+		// reports Completed, because the node goes down mid-command.
+		if _, failed, failMsg := r.commandState(ctx, fc, nodeID, fleetMachine.Annotations[rebootCommandIDAnnotation], fleet.CommandReboot); failed {
+			r.notReady(fleetMachine, "RebootFailed", fmt.Sprintf("reboot failed on node %s: %s", nodeID, failMsg))
+			delete(fleetMachine.Annotations, rebootRequestedAtAnnotation)
+			delete(fleetMachine.Annotations, rebootCommandIDAnnotation)
+			log.Info("Reboot failed; retrying with a fresh command", "nodeID", nodeID, "result", failMsg)
+			return ctrl.Result{RequeueAfter: retryRebootRequeue}, nil
+		}
 		log.Info("Waiting for node to rejoin after reboot", "nodeID", nodeID, "phase", node.Phase)
 		r.notReady(fleetMachine, "WaitingForNodeRejoin", "Waiting for the node to reboot and report Online")
 		return ctrl.Result{RequeueAfter: waitForRejoinRequeue}, nil
@@ -313,15 +336,16 @@ func (r *KairosFleetMachineReconciler) rejoinedAfterReboot(fleetMachine *infrav1
 	return node.LastHeartbeat.After(rebootedAt)
 }
 
-// applyState reports whether the apply-cloud-config command identified by cmdID
-// completed and, if it failed, the failure message.
+// commandState reports whether the command named by cmdID completed and, if it
+// failed, the failure message. name is the command kind (apply-cloud-config,
+// reboot) it belongs to, used only by the no-id fallback.
 //
 // AuroraBoot retains every command ever queued for a node, so the outcome must be
 // read from the command this controller queued. When cmdID is empty — a machine
 // first reconciled by a build that did not record it — fall back to the most
-// recently created apply-cloud-config. Matching the first entry instead would let
-// one early failure shadow every later success, permanently.
-func (r *KairosFleetMachineReconciler) applyState(ctx context.Context, fc fleet.Client, nodeID, cmdID string) (completed, failed bool, failMsg string) {
+// recently created command of that kind. Matching the first entry instead would
+// let one early failure shadow every later success, permanently.
+func (r *KairosFleetMachineReconciler) commandState(ctx context.Context, fc fleet.Client, nodeID, cmdID, name string) (completed, failed bool, failMsg string) {
 	cmds, err := fc.GetCommands(ctx, nodeID)
 	if err != nil {
 		// Treat a transient list error as "not yet completed"; the caller requeues.
@@ -338,7 +362,7 @@ func (r *KairosFleetMachineReconciler) applyState(ctx context.Context, fc fleet.
 			}
 			continue
 		}
-		if cmd.Command != fleet.CommandApplyCloudConfig {
+		if cmd.Command != name {
 			continue
 		}
 		if latest == nil || newerCommand(cmd, latest) {

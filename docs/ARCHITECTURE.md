@@ -60,8 +60,8 @@ to re-run from any point:
 | Wait for bootstrap | `Machine.spec.bootstrap.dataSecretName` is not yet set | Requeue; `WaitingForBootstrapData`. |
 | Claim | No `node-id` annotation yet | Resolve `spec.group` (a name or an ID) to the group's ID, then claim a node from it using the KairosFleetMachine's UID as a stable claim key, so a retried reconcile finds the same node instead of claiming a second one. A group that does not resolve requeues as `GroupNotFound`; no capacity in the resolved group requeues as `WaitingForCapacity`. Neither is an error. |
 | Apply cloud-config | Node claimed, config not yet applied | Fetch the bootstrap Secret's `value` key and hand it to AuroraBoot unmodified as an apply-cloud-config command. AuroraBoot stages the config to the node's `/oem` overlay; it does not reboot on its own. |
-| Reboot | The apply-cloud-config command reports `Completed` | Issue a reboot command and record the time it was requested. |
-| Wait for rejoin | Reboot issued | Poll the node; it has rejoined once its phase is `Online` and its last heartbeat is newer than the recorded reboot time. Using heartbeat-after-reboot rather than a phase transition means a reconcile that misses the transient `Offline` window still detects the rejoin correctly. |
+| Reboot | The apply-cloud-config command reports `Completed` | Issue a reboot command and record both the time it was requested and the command's ID. |
+| Wait for rejoin | Reboot issued | Poll the node; it has rejoined once its phase is `Online` and its last heartbeat is newer than the recorded reboot time. Using heartbeat-after-reboot rather than a phase transition means a reconcile that misses the transient `Offline` window still detects the rejoin correctly. While it has not rejoined, read the reboot command back: a `Failed` or `Expired` reboot is retried like a rejected apply, because waiting for a boot the node refused to perform never ends. |
 | Provisioned | Rejoin confirmed | Set `status.addresses`, `spec.providerID`, `status.initialization.provisioned = true`, and the `Ready` condition. |
 | Delete | `deletionTimestamp` set | Release the claimed node back to its group using the same claim key, then remove the finalizer. If the AuroraBoot connection cannot be resolved at all any more, the finalizer is still removed; see "Delete: release versus reset". |
 
@@ -71,7 +71,13 @@ controller clears the applied-config marker and re-issues a fresh
 apply-cloud-config command about once a minute, so fixing whatever rejected
 the command — most commonly the node's AuroraBoot phonehome policy, see
 [QUICKSTART.md](QUICKSTART.md) — unsticks the machine with no manual
-intervention. A claimed node that disappears from AuroraBoot entirely is
+intervention. The reboot step behaves the same way, with a `RebootFailed`
+`Ready` condition: `reboot` is a separate command with its own entry in the
+node's `allowed_commands` policy, so a node that accepted the apply can still
+refuse the reboot. Only a terminal phase counts there. A reboot the node did
+accept usually never reports `Completed`, because the node goes down in the
+middle of running it, so the controller waits on the heartbeat rather than on
+the command for every non-terminal phase. A claimed node that disappears from AuroraBoot entirely is
 still a terminal failure: `status.failureReason` and `status.failureMessage`
 are set and the machine does not retry itself; delete and re-create the
 Machine to try again.
