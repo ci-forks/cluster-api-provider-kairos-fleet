@@ -63,7 +63,7 @@ to re-run from any point:
 | Reboot | The apply-cloud-config command reports `Completed` | Issue a reboot command and record the time it was requested. |
 | Wait for rejoin | Reboot issued | Poll the node; it has rejoined once its phase is `Online` and its last heartbeat is newer than the recorded reboot time. Using heartbeat-after-reboot rather than a phase transition means a reconcile that misses the transient `Offline` window still detects the rejoin correctly. |
 | Provisioned | Rejoin confirmed | Set `status.addresses`, `spec.providerID`, `status.initialization.provisioned = true`, and the `Ready` condition. |
-| Delete | `deletionTimestamp` set | Release the claimed node back to its group using the same claim key, then remove the finalizer. |
+| Delete | `deletionTimestamp` set | Release the claimed node back to its group using the same claim key, then remove the finalizer. If the AuroraBoot connection cannot be resolved at all any more, the finalizer is still removed; see "Delete: release versus reset". |
 
 A command that reports `Failed` or `Expired` during the apply-cloud-config
 step sets a `CloudConfigFailed` `Ready` condition and is not terminal: the
@@ -133,6 +133,15 @@ exposes a reset lifecycle (wipe-and-reuse), which is the more correct choice
 when a node must be scrubbed before reuse (multi-tenant handoff,
 decommissioning). This provider does not use it yet: v0.1 always releases. A
 `deletePolicy` field to opt into reset is a planned follow-up.
+
+The release is best effort. The `KairosFleetCluster` removes its own finalizer
+as soon as it is deleted, so it and its admin-token Secret can already be gone
+while machines are still terminating, and then no release is possible from any
+later reconcile either. Deletion proceeds in that case rather than stranding
+the Machine, and the Cluster behind it, in `Terminating`. A read error that is
+not a NotFound is different: it can clear on the next attempt, so the
+reconcile fails and retries instead of removing the finalizer and leaving the
+node claimed with nothing left to release it.
 
 ## AuroraBoot connection and RBAC
 

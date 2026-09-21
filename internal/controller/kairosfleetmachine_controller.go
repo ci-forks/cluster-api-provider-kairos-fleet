@@ -18,10 +18,12 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -120,7 +122,7 @@ func (r *KairosFleetMachineReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	if !fleetMachine.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, fleetMachine, cluster)
+		return ctrl.Result{}, r.reconcileDelete(ctx, fleetMachine, cluster)
 	}
 	return r.reconcileNormal(ctx, fleetMachine, machine, cluster)
 }
@@ -265,31 +267,36 @@ func (r *KairosFleetMachineReconciler) reconcileNormal(ctx context.Context, flee
 	return ctrl.Result{}, nil
 }
 
-func (r *KairosFleetMachineReconciler) reconcileDelete(ctx context.Context, fleetMachine *infrav1.KairosFleetMachine, cluster *clusterv1.Cluster) (ctrl.Result, error) {
+// reconcileDelete releases the claimed node and removes the finalizer. It returns
+// only an error: the delete path either finishes or fails, and a failure is retried
+// by the controller's own backoff, so no timed requeue is left on it.
+func (r *KairosFleetMachineReconciler) reconcileDelete(ctx context.Context, fleetMachine *infrav1.KairosFleetMachine, cluster *clusterv1.Cluster) error {
 	log := logf.FromContext(ctx)
 
 	nodeID := fleetMachine.Annotations[infrav1.NodeIDAnnotation]
 	if nodeID != "" {
-		fc, res, err := r.fleetClientFor(ctx, cluster)
+		fc, err := r.fleetClientForDelete(ctx, cluster)
 		switch {
+		case err != nil && !isPermanentlyUnresolvable(err):
+			// A transient read error. Retry: giving up here would remove the
+			// finalizer and leak the node's claim, so the group never gets it back.
+			return fmt.Errorf("resolving AuroraBoot connection to release node %s: %w", nodeID, err)
 		case err != nil:
-			// Cannot resolve the AuroraBoot connection (e.g. the KairosFleetCluster or
-			// its Secret is already gone). Nothing more we can do to release the node;
-			// log and let deletion proceed rather than blocking it forever.
-			log.Info("Cannot resolve AuroraBoot connection on delete; releasing finalizer without release", "err", err.Error())
-		case fc == nil:
-			return res, nil
+			// The KairosFleetCluster or its admin-token Secret is gone for good, so
+			// there is no way left to reach AuroraBoot. Nothing about that recovers
+			// while the machine sits in Terminating; log and let deletion proceed.
+			log.Info("Cannot resolve AuroraBoot connection on delete; removing finalizer without release", "err", err.Error())
 		default:
 			claimKey := string(fleetMachine.UID)
 			if _, err := fc.Release(ctx, nodeID, claimKey); err != nil && !fleet.IsNotFound(err) {
-				return ctrl.Result{}, fmt.Errorf("releasing node %s: %w", nodeID, err)
+				return fmt.Errorf("releasing node %s: %w", nodeID, err)
 			}
 			log.Info("Released AuroraBoot node", "nodeID", nodeID)
 		}
 	}
 
 	controllerutil.RemoveFinalizer(fleetMachine, infrav1.KairosFleetMachineFinalizer)
-	return ctrl.Result{}, nil
+	return nil
 }
 
 // rejoinedAfterReboot reports whether the node has come back Online after the reboot
@@ -377,6 +384,30 @@ func (r *KairosFleetMachineReconciler) fleetClientFor(ctx context.Context, clust
 		return nil, ctrl.Result{RequeueAfter: waitForCapacityRequeue}, nil
 	}
 	return fc, ctrl.Result{}, nil
+}
+
+// fleetClientForDelete resolves a fleet.Client for the release-on-delete path. It
+// reports every failure as an error, where fleetClientFor folds a missing
+// KairosFleetCluster and an unusable connection into "wait and retry". On delete
+// that distinction matters: the InfraCluster removes its own finalizer as soon as it
+// is deleted (it owns no external infrastructure), so it and its Secret can already
+// be gone while machines are still terminating, and waiting for them is waiting
+// forever.
+func (r *KairosFleetMachineReconciler) fleetClientForDelete(ctx context.Context, cluster *clusterv1.Cluster) (fleet.Client, error) {
+	fleetCluster := &infrav1.KairosFleetCluster{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Spec.InfrastructureRef.Name}
+	if err := r.Get(ctx, key, fleetCluster); err != nil {
+		return nil, fmt.Errorf("getting KairosFleetCluster %s: %w", key, err)
+	}
+	return resolveFleetClient(ctx, r.Client, r.fleetFactory(), fleetCluster)
+}
+
+// isPermanentlyUnresolvable reports whether an AuroraBoot connection failure will
+// still be a failure on every later attempt: the KairosFleetCluster or the Secret
+// does not exist, or the connection is missing its url or token. Anything else is a
+// read failure that can succeed on a retry.
+func isPermanentlyUnresolvable(err error) bool {
+	return apierrors.IsNotFound(err) || errors.Is(err, errConnectionIncomplete)
 }
 
 func (r *KairosFleetMachineReconciler) bootstrapData(ctx context.Context, machine *clusterv1.Machine) (string, error) {
