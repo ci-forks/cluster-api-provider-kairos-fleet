@@ -48,7 +48,7 @@ AuroraBoot node.
 | `initialization.provisioned` | bool | The Cluster API v1beta2 InfraMachine readiness signal. True once the node is claimed, its cloud-config applied, and it has rejoined `Online`. |
 | `addresses` | `[]clusterv1.MachineAddress` | A single `Hostname` address in v0.1 (see [ARCHITECTURE.md](ARCHITECTURE.md)). |
 | `conditions` | `[]metav1.Condition` | Includes a `Ready` condition; see [QUICKSTART.md](QUICKSTART.md) for the reason values it cycles through. |
-| `failureReason` / `failureMessage` | string | Set only on a terminal, unrecoverable failure: a claimed node that disappears from AuroraBoot entirely. A failed or expired `apply-cloud-config` command is not terminal; it sets a `CloudConfigFailed` `Ready` condition and is retried automatically (see [QUICKSTART.md](QUICKSTART.md)). |
+| `failureReason` / `failureMessage` | string | Set only on a terminal, unrecoverable failure: a claimed node that disappears from AuroraBoot entirely. A failed or expired `apply-cloud-config` or `reboot` command is not terminal; it sets a `CloudConfigFailed` or `RebootFailed` `Ready` condition and is retried automatically (see [QUICKSTART.md](QUICKSTART.md)). |
 
 ### Annotations the controller manages
 
@@ -59,7 +59,8 @@ These are set by the controller, not the user:
 | `kairos-fleet.infrastructure.cluster.x-k8s.io/node-id` | The claimed AuroraBoot node's ID. Source of `spec.providerID` and the release call on delete. |
 | `kairos-fleet.infrastructure.cluster.x-k8s.io/cloud-config-applied` | Marks that the bootstrap cloud-config has been handed to AuroraBoot, so it is not re-applied on every reconcile. Cleared automatically if the apply-cloud-config command later reports `Failed` or `Expired`, so a fixed node gets a fresh apply on the next reconcile. |
 | `kairos-fleet.infrastructure.cluster.x-k8s.io/cloud-config-command-id` | The ID of the apply-cloud-config command the controller queued. Its outcome is read back from this exact command, not the first apply-cloud-config found for the node: AuroraBoot never prunes a node's command history, so an earlier failed attempt would otherwise shadow every later success. Cleared alongside `cloud-config-applied` on a `Failed` or `Expired` outcome. |
-| `kairos-fleet.infrastructure.cluster.x-k8s.io/reboot-requested-at` | RFC 3339 timestamp of the reboot the controller requested to apply the staged config; used to detect rejoin. |
+| `kairos-fleet.infrastructure.cluster.x-k8s.io/reboot-requested-at` | RFC 3339 timestamp of the reboot the controller requested to apply the staged config; used to detect rejoin. Cleared, with `reboot-command-id`, if that reboot reports `Failed` or `Expired`, so a fresh one is issued. |
+| `kairos-fleet.infrastructure.cluster.x-k8s.io/reboot-command-id` | The ID of the reboot command the controller queued, so its outcome is read back from that exact command and an earlier failed reboot of the same node cannot shadow it. Same reasoning as `cloud-config-command-id`. |
 
 ## KairosFleetClusterTemplate
 

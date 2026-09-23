@@ -70,6 +70,11 @@ Fix this before enrolling nodes, either of two ways:
 - Or set `phonehome.allowed_commands` directly in the node's own cloud-config,
   to a list containing at least `apply-cloud-config`, `reboot`, and `reset`.
 
+The list is a replacement, not an addition: a `phonehome.allowed_commands`
+that names only `apply-cloud-config` drops `reboot` along with the rest of the
+default set, and the machine then fails at the reboot step instead of the
+apply step, with `RebootFailed` on its `Ready` condition.
+
 ### Fixing an already-enrolled node
 
 If a node was already enrolled with the default policy, append the missing
@@ -163,6 +168,7 @@ kubectl get kairosfleetmachines -n demo -w
 | `ApplyingCloudConfig` | The cloud-config has been handed to AuroraBoot and is being written to the node, or the controller is waiting for that write to complete. |
 | `CloudConfigFailed` | The apply-cloud-config command reported `Failed` or `Expired` — commonly because the node's AuroraBoot phonehome policy does not permit the command (see "AuroraBoot node enrolment prerequisite" above). Not terminal: the controller clears the applied-config marker and retries automatically once the node accepts the command. |
 | `Rebooting` | The controller has requested a reboot so the node applies the staged config. |
+| `RebootFailed` | The reboot command reported `Failed` or `Expired`. `reboot` has its own entry in the node's `allowed_commands` policy, so a node that accepted the apply can still refuse it. Not terminal: the controller clears the reboot markers and issues a fresh reboot about once a minute. |
 | `WaitingForNodeRejoin` | Waiting for the node to come back `Online` with a heartbeat newer than the reboot request. |
 | `NodeMissing` | The claimed AuroraBoot node no longer exists. Terminal: `status.failureReason` and `status.failureMessage` are set; the machine does not retry itself. |
 | `Provisioned` | The node is claimed, configured, and Online. `spec.providerID` and `status.addresses` are set. |

@@ -18,11 +18,13 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -47,6 +49,9 @@ const (
 	// fakeApplyCommandID is the command ID fleet.FakeClient.ApplyCloudConfig
 	// returns; the reconciler records it and reads that command's outcome back.
 	fakeApplyCommandID = "fake-cmd"
+
+	// fakeRebootCommandID is the same for fleet.FakeClient.Reboot.
+	fakeRebootCommandID = "fake-reboot"
 )
 
 func testScheme(t *testing.T) *runtime.Scheme {
@@ -409,9 +414,31 @@ func TestApplyState_WithoutACommandIDPicksTheNewest(t *testing.T) {
 		},
 	}
 	r := &KairosFleetMachineReconciler{}
-	completed, failed, msg := r.applyState(context.Background(), fc, testNodeID, "")
+	completed, failed, msg := r.commandState(context.Background(), fc, testNodeID, "", fleet.CommandApplyCloudConfig)
 	if !completed || failed {
 		t.Fatalf("completed=%v failed=%v msg=%q, want the newest (completed) command to win", completed, failed, msg)
+	}
+}
+
+// The no-id fallback must also filter by command kind: a node whose last command
+// was a failed reboot must not have that read back as the apply's outcome.
+func TestCommandState_WithoutACommandIDFiltersByKind(t *testing.T) {
+	older := time.Now().Add(-time.Hour)
+	newer := time.Now()
+	fc := &fleet.FakeClient{
+		GetCommandsFunc: func(_ context.Context, _ string) ([]fleet.Command, error) {
+			return []fleet.Command{
+				{ID: "apply", Command: fleet.CommandApplyCloudConfig, Phase: fleet.CommandPhaseCompleted, CreatedAt: &older},
+				{ID: "reboot", Command: fleet.CommandReboot, Phase: fleet.CommandPhaseFailed, Result: "denied", CreatedAt: &newer},
+			}, nil
+		},
+	}
+	r := &KairosFleetMachineReconciler{}
+	if completed, failed, _ := r.commandState(context.Background(), fc, testNodeID, "", fleet.CommandApplyCloudConfig); !completed || failed {
+		t.Fatalf("the apply completed; the later failed reboot must not shadow it")
+	}
+	if _, failed, msg := r.commandState(context.Background(), fc, testNodeID, "", fleet.CommandReboot); !failed || msg != "denied" {
+		t.Fatalf("failed=%v msg=%q, want the reboot's own failure", failed, msg)
 	}
 }
 
@@ -576,5 +603,156 @@ func TestMachineReconcile_KeepsFinalizerOnTransientReadError(t *testing.T) {
 	}
 	if !controllerutil.ContainsFinalizer(kfm, infrav1.KairosFleetMachineFinalizer) {
 		t.Fatalf("expected the finalizer to be kept so the claim is not leaked")
+	}
+}
+
+// A node enrolled with a phonehome policy that permits apply-cloud-config but not
+// reboot completes its apply and then rejects the reboot. Without reading the
+// reboot command back, the machine waits on WaitingForNodeRejoin forever, with the
+// reason on the node never surfaced.
+func TestMachineReconcile_RetriesARejectedReboot(t *testing.T) {
+	const rejected = `command "reboot" is not permitted by the phonehome policy`
+	rebootRejected := true
+	fc := &fleet.FakeClient{
+		ClaimFunc: func(_ context.Context, _, _ string) (*fleet.Node, error) {
+			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOnline}, nil
+		},
+		GetNodeFunc: func(_ context.Context, _ string) (*fleet.Node, error) {
+			// Still up on its old boot: Online, but no heartbeat after the reboot.
+			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOnline}, nil
+		},
+		GetCommandsFunc: func(_ context.Context, _ string) ([]fleet.Command, error) {
+			cmds := []fleet.Command{{ID: fakeApplyCommandID, Command: fleet.CommandApplyCloudConfig, Phase: fleet.CommandPhaseCompleted}}
+			if rebootRejected {
+				cmds = append(cmds, fleet.Command{
+					ID: fakeRebootCommandID, Command: fleet.CommandReboot,
+					Phase: fleet.CommandPhaseFailed, Result: rejected,
+				})
+			}
+			return cmds, nil
+		},
+	}
+	r, c := newReconciler(t, fc, testFixture(true))
+
+	reconcileKFM(t, r) // claim
+	reconcileKFM(t, r) // apply
+	reconcileKFM(t, r) // reboot (1st)
+	res := reconcileKFM(t, r)
+
+	if res.RequeueAfter != retryRebootRequeue {
+		t.Fatalf("RequeueAfter = %v, want %v so the reboot is retried", res.RequeueAfter, retryRebootRequeue)
+	}
+	kfm := getKFM(t, c)
+	if kfm.Status.FailureReason != nil || kfm.Status.FailureMessage != nil {
+		t.Fatalf("a rejected reboot is recoverable and must not set a terminal failure, got reason=%v message=%v",
+			ptr.Deref(kfm.Status.FailureReason, ""), ptr.Deref(kfm.Status.FailureMessage, ""))
+	}
+	if kfm.Annotations[rebootRequestedAtAnnotation] != "" || kfm.Annotations[rebootCommandIDAnnotation] != "" {
+		t.Fatalf("expected the reboot markers to be cleared so a fresh reboot is queued, got %v", kfm.Annotations)
+	}
+	if kfm.Annotations[cloudConfigAppliedAnnotation] != cloudConfigAppliedValue {
+		t.Fatalf("the applied cloud-config must be kept across a reboot retry, got %v", kfm.Annotations)
+	}
+	ready := meta.FindStatusCondition(kfm.Status.Conditions, clusterv1.ReadyCondition)
+	if ready == nil || ready.Reason != "RebootFailed" || !strings.Contains(ready.Message, rejected) {
+		t.Fatalf("expected the node's rejection on the Ready condition, got %+v", ready)
+	}
+
+	// The operator fixes the policy; the next pass queues a second reboot and the
+	// node rejoins.
+	rebootRejected = false
+	reconcileKFM(t, r) // reboot (2nd)
+	if len(fc.Reboots) != 2 {
+		t.Fatalf("expected a second reboot after the retry, got %+v", fc.Reboots)
+	}
+	hb := time.Now().Add(time.Hour)
+	fc.GetNodeFunc = func(_ context.Context, _ string) (*fleet.Node, error) {
+		return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOnline, LastHeartbeat: &hb}, nil
+	}
+	reconcileKFM(t, r) // provisioned
+	if !ptr.Deref(getKFM(t, c).Status.Initialization.Provisioned, false) {
+		t.Fatalf("expected the machine to provision once the reboot went through")
+	}
+}
+
+// AuroraBoot never prunes a node's command history, so a reboot that failed on an
+// earlier attempt is still in the list. The controller records the ID of the reboot
+// it queued and reads that exact command back, so an earlier failure cannot shadow
+// the current attempt and put the machine in a reboot loop. Same guarantee
+// apply-cloud-config already had, see TestMachineReconcile_IgnoresAnEarlierFailedApply.
+func TestMachineReconcile_IgnoresAnEarlierFailedReboot(t *testing.T) {
+	fc := &fleet.FakeClient{
+		ClaimFunc: func(_ context.Context, _, _ string) (*fleet.Node, error) {
+			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOnline}, nil
+		},
+		GetNodeFunc: func(_ context.Context, _ string) (*fleet.Node, error) {
+			// Going down: no heartbeat past the reboot yet, so the outcome of the
+			// reboot command is what decides between waiting and retrying.
+			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOffline}, nil
+		},
+		GetCommandsFunc: func(_ context.Context, _ string) ([]fleet.Command, error) {
+			return []fleet.Command{
+				{ID: fakeApplyCommandID, Command: fleet.CommandApplyCloudConfig, Phase: fleet.CommandPhaseCompleted},
+				// Untimestamped, so the no-id fallback would pick this one.
+				{
+					ID: "stale-reboot", Command: fleet.CommandReboot,
+					Phase:  fleet.CommandPhaseFailed,
+					Result: `command "reboot" is not permitted by the phonehome policy`,
+				},
+				{ID: fakeRebootCommandID, Command: fleet.CommandReboot, Phase: fleet.CommandPhaseRunning},
+			}, nil
+		},
+	}
+	r, c := newReconciler(t, fc, testFixture(true))
+
+	reconcileKFM(t, r) // claim
+	reconcileKFM(t, r) // apply
+	reconcileKFM(t, r) // reboot
+	res := reconcileKFM(t, r)
+
+	if res.RequeueAfter != waitForRejoinRequeue {
+		t.Fatalf("RequeueAfter = %v, want %v: the stale failure must not trigger a retry", res.RequeueAfter, waitForRejoinRequeue)
+	}
+	if len(fc.Reboots) != 1 {
+		t.Fatalf("expected the stale reboot failure to be ignored, got %+v", fc.Reboots)
+	}
+	if getKFM(t, c).Annotations[rebootCommandIDAnnotation] != fakeRebootCommandID {
+		t.Fatalf("expected the queued reboot's ID to be recorded, got %v", getKFM(t, c).Annotations)
+	}
+}
+
+// A reboot that the node accepted must not be re-issued just because its command
+// never reached a terminal phase: the node dies mid-command, so the outcome the
+// controller reads back is usually Running or Delivered, not Completed.
+func TestMachineReconcile_DoesNotRetryARebootInFlight(t *testing.T) {
+	fc := &fleet.FakeClient{
+		ClaimFunc: func(_ context.Context, _, _ string) (*fleet.Node, error) {
+			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOnline}, nil
+		},
+		GetNodeFunc: func(_ context.Context, _ string) (*fleet.Node, error) {
+			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOffline}, nil
+		},
+		GetCommandsFunc: func(_ context.Context, _ string) ([]fleet.Command, error) {
+			return []fleet.Command{
+				{ID: fakeApplyCommandID, Command: fleet.CommandApplyCloudConfig, Phase: fleet.CommandPhaseCompleted},
+				{ID: fakeRebootCommandID, Command: fleet.CommandReboot, Phase: fleet.CommandPhaseRunning},
+			}, nil
+		},
+	}
+	r, c := newReconciler(t, fc, testFixture(true))
+
+	reconcileKFM(t, r) // claim
+	reconcileKFM(t, r) // apply
+	reconcileKFM(t, r) // reboot
+	res := reconcileKFM(t, r)
+
+	if res.RequeueAfter != waitForRejoinRequeue {
+		t.Fatalf("RequeueAfter = %v, want %v: an in-flight reboot is just a wait", res.RequeueAfter, waitForRejoinRequeue)
+	}
+	if len(fc.Reboots) != 1 {
+		t.Fatalf("expected exactly one reboot while the first is in flight, got %+v", fc.Reboots)
+	}
+	if getKFM(t, c).Annotations[rebootRequestedAtAnnotation] == "" {
+		t.Fatalf("the reboot marker must survive a reconcile that is only waiting")
 	}
 }

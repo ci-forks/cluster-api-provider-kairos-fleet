@@ -55,6 +55,12 @@ const (
 	// node heartbeat newer than this time.
 	rebootRequestedAtAnnotation = "kairos-fleet.infrastructure.cluster.x-k8s.io/reboot-requested-at"
 
+	// rebootCommandIDAnnotation records the ID of the reboot command the
+	// controller queued, so a rejected reboot is read back from that command
+	// rather than from an earlier reboot of the same node. Same reasoning as
+	// cloudConfigCommandIDAnnotation.
+	rebootCommandIDAnnotation = "kairos-fleet.infrastructure.cluster.x-k8s.io/reboot-command-id"
+
 	// providerIDPrefix is the scheme for KairosFleetMachine provider IDs. The node
 	// identifier is the AuroraBoot node ID (see ADR 0001 §3).
 	providerIDPrefix = "kairos-fleet://"
