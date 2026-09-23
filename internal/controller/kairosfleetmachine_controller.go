@@ -262,7 +262,17 @@ func (r *KairosFleetMachineReconciler) reconcileNormal(ctx context.Context, flee
 		// happen, and the node's reason for refusing is never surfaced. Only a
 		// terminal failure counts - a reboot the node accepted usually never
 		// reports Completed, because the node goes down mid-command.
-		if _, failed, failMsg := r.commandState(ctx, fc, nodeID, fleetMachine.Annotations[rebootCommandIDAnnotation], fleet.CommandReboot); failed {
+		//
+		// Only ask while the node is Online. A node that refuses the reboot stays
+		// up to refuse it, so the case this retry exists for is unaffected. A node
+		// that is Offline is plausibly performing the reboot, and it cannot report
+		// anything while it is down, so a terminal phase on its reboot command was
+		// not written by the node: AuroraBoot's admin status endpoint is unscoped,
+		// and an expiry sweep added later would be too. Retrying on that reboots a
+		// machine already on its way back, and for an HA control plane it bounces
+		// a freshly joined etcd member. Waiting instead is what the heartbeat
+		// check above already does.
+		if failed, failMsg := r.rebootFailed(ctx, fc, fleetMachine, node, nodeID); failed {
 			r.notReady(fleetMachine, "RebootFailed", fmt.Sprintf("reboot failed on node %s: %s", nodeID, failMsg))
 			delete(fleetMachine.Annotations, rebootRequestedAtAnnotation)
 			delete(fleetMachine.Annotations, rebootCommandIDAnnotation)
@@ -320,6 +330,18 @@ func (r *KairosFleetMachineReconciler) reconcileDelete(ctx context.Context, flee
 
 	controllerutil.RemoveFinalizer(fleetMachine, infrav1.KairosFleetMachineFinalizer)
 	return nil
+}
+
+// rebootFailed reports whether the reboot this controller queued failed, and the
+// failure message, asking only while the node is still Online. See the call site
+// for why a terminal phase reported while the node is away is not the node's own
+// verdict on the reboot.
+func (r *KairosFleetMachineReconciler) rebootFailed(ctx context.Context, fc fleet.Client, fleetMachine *infrav1.KairosFleetMachine, node *fleet.Node, nodeID string) (bool, string) {
+	if node.Phase != fleet.PhaseOnline {
+		return false, ""
+	}
+	_, failed, failMsg := r.commandState(ctx, fc, nodeID, fleetMachine.Annotations[rebootCommandIDAnnotation], fleet.CommandReboot)
+	return failed, failMsg
 }
 
 // rejoinedAfterReboot reports whether the node has come back Online after the reboot

@@ -686,20 +686,24 @@ func TestMachineReconcile_IgnoresAnEarlierFailedReboot(t *testing.T) {
 			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOnline}, nil
 		},
 		GetNodeFunc: func(_ context.Context, _ string) (*fleet.Node, error) {
-			// Going down: no heartbeat past the reboot yet, so the outcome of the
-			// reboot command is what decides between waiting and retrying.
-			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOffline}, nil
+			// Still up on its old boot: Online with no heartbeat past the reboot, so
+			// the outcome of the reboot command is what decides between waiting and
+			// retrying. Offline would short-circuit that, see
+			// TestMachineReconcile_DoesNotRetryARebootWhileTheNodeIsAway.
+			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOnline}, nil
 		},
 		GetCommandsFunc: func(_ context.Context, _ string) ([]fleet.Command, error) {
 			return []fleet.Command{
 				{ID: fakeApplyCommandID, Command: fleet.CommandApplyCloudConfig, Phase: fleet.CommandPhaseCompleted},
-				// Untimestamped, so the no-id fallback would pick this one.
+				{ID: fakeRebootCommandID, Command: fleet.CommandReboot, Phase: fleet.CommandPhaseRunning},
+				// Neither reboot carries a created_at, so there is nothing to order
+				// them by and the no-id fallback picks this one. Matching on the
+				// recorded ID is the only thing that tells them apart.
 				{
 					ID: "stale-reboot", Command: fleet.CommandReboot,
 					Phase:  fleet.CommandPhaseFailed,
 					Result: `command "reboot" is not permitted by the phonehome policy`,
 				},
-				{ID: fakeRebootCommandID, Command: fleet.CommandReboot, Phase: fleet.CommandPhaseRunning},
 			}, nil
 		},
 	}
@@ -730,7 +734,9 @@ func TestMachineReconcile_DoesNotRetryARebootInFlight(t *testing.T) {
 			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOnline}, nil
 		},
 		GetNodeFunc: func(_ context.Context, _ string) (*fleet.Node, error) {
-			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOffline}, nil
+			// Online with no heartbeat past the reboot, so the reboot command is
+			// read back and its non-terminal phase is what holds the retry off.
+			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOnline}, nil
 		},
 		GetCommandsFunc: func(_ context.Context, _ string) ([]fleet.Command, error) {
 			return []fleet.Command{
@@ -754,5 +760,66 @@ func TestMachineReconcile_DoesNotRetryARebootInFlight(t *testing.T) {
 	}
 	if getKFM(t, c).Annotations[rebootRequestedAtAnnotation] == "" {
 		t.Fatalf("the reboot marker must survive a reconcile that is only waiting")
+	}
+}
+
+// A node that is away cannot report on its own reboot, so a terminal phase on the
+// reboot command while it is Offline did not come from the node: AuroraBoot's
+// PUT /commands/:id/status is unscoped for an admin token, and a server-side
+// expiry sweep would be unscoped too. Acting on it reboots a machine that is
+// already coming back, which for an HA control plane bounces a freshly joined
+// etcd member. The controller waits on the heartbeat instead.
+func TestMachineReconcile_DoesNotRetryARebootWhileTheNodeIsAway(t *testing.T) {
+	fc := &fleet.FakeClient{
+		ClaimFunc: func(_ context.Context, _, _ string) (*fleet.Node, error) {
+			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOnline}, nil
+		},
+		GetNodeFunc: func(_ context.Context, _ string) (*fleet.Node, error) {
+			return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOffline}, nil
+		},
+		GetCommandsFunc: func(_ context.Context, _ string) ([]fleet.Command, error) {
+			return []fleet.Command{
+				{ID: fakeApplyCommandID, Command: fleet.CommandApplyCloudConfig, Phase: fleet.CommandPhaseCompleted},
+				{
+					ID: fakeRebootCommandID, Command: fleet.CommandReboot,
+					Phase: fleet.CommandPhaseFailed, Result: "expired",
+				},
+			}, nil
+		},
+	}
+	r, c := newReconciler(t, fc, testFixture(true))
+
+	reconcileKFM(t, r) // claim
+	reconcileKFM(t, r) // apply
+	reconcileKFM(t, r) // reboot
+	res := reconcileKFM(t, r)
+
+	if res.RequeueAfter != waitForRejoinRequeue {
+		t.Fatalf("RequeueAfter = %v, want %v: a reboot marked terminal while the node is away is still a wait", res.RequeueAfter, waitForRejoinRequeue)
+	}
+	if len(fc.Reboots) != 1 {
+		t.Fatalf("expected no second reboot while the node is away, got %+v", fc.Reboots)
+	}
+	kfm := getKFM(t, c)
+	if kfm.Annotations[rebootRequestedAtAnnotation] == "" || kfm.Annotations[rebootCommandIDAnnotation] != fakeRebootCommandID {
+		t.Fatalf("the reboot markers must survive, otherwise the next pass queues a second reboot, got %v", kfm.Annotations)
+	}
+	ready := meta.FindStatusCondition(kfm.Status.Conditions, clusterv1.ReadyCondition)
+	if ready == nil || ready.Reason != "WaitingForNodeRejoin" {
+		t.Fatalf("expected the machine to still be waiting for the rejoin, got %+v", ready)
+	}
+
+	// It comes back on a new boot: the machine provisions, and the failed reboot
+	// command it left behind never causes a retry.
+	hb := time.Now().Add(time.Hour)
+	fc.GetNodeFunc = func(_ context.Context, _ string) (*fleet.Node, error) {
+		return &fleet.Node{ID: testNodeID, Hostname: testHostname, Phase: fleet.PhaseOnline, LastHeartbeat: &hb}, nil
+	}
+	reconcileKFM(t, r)
+	if !ptr.Deref(getKFM(t, c).Status.Initialization.Provisioned, false) {
+		t.Fatalf("expected the machine to provision once the node rejoined")
+	}
+	if len(fc.Reboots) != 1 {
+		t.Fatalf("expected still exactly one reboot after the node rejoined, got %+v", fc.Reboots)
 	}
 }
