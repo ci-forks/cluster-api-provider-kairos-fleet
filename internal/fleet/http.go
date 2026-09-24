@@ -282,7 +282,7 @@ func (d *nodeDTO) toNode() *Node {
 		LastHeartbeat: d.LastHeartbeat,
 	}
 	for _, a := range d.Addresses {
-		n.Addresses = append(n.Addresses, NodeAddress{Type: a.Type, Address: a.Address})
+		n.Addresses = append(n.Addresses, NodeAddress(a))
 	}
 	return n
 }
